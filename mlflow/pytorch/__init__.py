@@ -1,7 +1,6 @@
 """
 The ``mlflow.pytorch`` module provides an API for logging and loading PyTorch models. This module
 exports PyTorch models with the following flavors:
-
 PyTorch (native) format
     This is the main flavor that can be loaded back into PyTorch.
 :py:mod:`mlflow.pyfunc`
@@ -15,8 +14,10 @@ import yaml
 import cloudpickle
 import numpy as np
 import pandas as pd
+import posixpath
 
 import mlflow
+import shutil
 import mlflow.pyfunc.utils as pyfunc_utils
 from mlflow import pyfunc
 from mlflow.exceptions import MlflowException
@@ -27,7 +28,7 @@ from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from mlflow.pytorch import pickle_module as mlflow_pytorch_pickle_module
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.environment import _mlflow_conda_env
-from mlflow.utils.file_utils import _copy_file_or_tree
+from mlflow.utils.file_utils import _copy_file_or_tree, TempDir
 from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 
@@ -72,27 +73,24 @@ def log_model(
     signature: ModelSignature = None,
     input_example: ModelInputExample = None,
     await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS,
+    artifacts=None,
     **kwargs
 ):
     """
     Log a PyTorch model as an MLflow artifact for the current run.
-
     :param pytorch_model: PyTorch model to be saved. Must accept a single ``torch.FloatTensor`` as
                           input and produce a single output tensor. Any code dependencies of the
                           model's class, including the class definition itself, should be
                           included in one of the following locations:
-
                           - The package(s) listed in the model's Conda environment, specified
                             by the ``conda_env`` parameter.
                           - One or more of the files specified by the ``code_paths`` parameter.
-
     :param artifact_path: Run-relative artifact path.
     :param conda_env: Path to a Conda environment file. If provided, this decsribes the environment
                       this model should be run in. At minimum, it should specify the dependencies
                       contained in :func:`get_default_conda_env()`. If ``None``, the default
                       :func:`get_default_conda_env()` environment is added to the model. The
                       following is an *example* dictionary representation of a Conda environment::
-
                         {
                             'name': 'mlflow-env',
                             'channels': ['defaults'],
@@ -102,7 +100,6 @@ def log_model(
                                 'torchvision=0.2.1'
                             ]
                         }
-
     :param code_paths: A list of local filesystem paths to Python file dependencies (or directories
                        containing file dependencies). These files are *prepended* to the system
                        path when the model is loaded.
@@ -113,16 +110,13 @@ def log_model(
     :param registered_model_name: (Experimental) If given, create a model version under
                                   ``registered_model_name``, also creating a registered model if one
                                   with the given name does not exist.
-
     :param signature: (Experimental) :py:class:`ModelSignature <mlflow.models.ModelSignature>`
                       describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
                       The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
                       from datasets with valid model input (e.g. the training dataset with target
                       column omitted) and valid model output (e.g. model predictions generated on
                       the training dataset), for example:
-
                       .. code-block:: python
-
                         from mlflow.models.signature import infer_signature
                         train = df.drop_column("target_label")
                         predictions = ... # compute model predictions
@@ -132,15 +126,26 @@ def log_model(
                           model. The given example will be converted to a Pandas DataFrame and then
                           serialized to json using the Pandas split-oriented format. Bytes are
                           base64-encoded.
-
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.
+    :param artifacts: A dictionary containing ``<name, artifact_uri>`` entries. Remote artifact URIs
+                      are resolved to absolute filesystem paths, producing a dictionary of
+                      ``<name, absolute_path>`` entries. ``python_model`` can reference these
+                      resolved entries as the ``artifacts`` property of the ``context`` parameter
+                      in :func:`PythonModel.load_context() <mlflow.pyfunc.PythonModel.load_context>`
+                      and :func:`PythonModel.predict() <mlflow.pyfunc.PythonModel.predict>`.
+                      For example, consider the following ``artifacts`` dictionary::
+                        {
+                            "my_file": "s3://my-bucket/path/to/my/file"
+                        }
+                      In this case, the ``"my_file"`` artifact is downloaded from S3. The
+                      ``python_model`` can then refer to ``"my_file"`` as an absolute filesystem
+                      path via ``context.artifacts["my_file"]``.
+                      If ``None``, no artifacts are added to the model.
     :param kwargs: kwargs to pass to ``torch.save`` method.
-
     .. code-block:: python
         :caption: Example
-
         import torch
         import mlflow
         import mlflow.pytorch
@@ -172,7 +177,6 @@ def log_model(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
         # After training
         for hv in [4.0, 5.0, 6.0]:
             hour_var = torch.Tensor([[hv]])
@@ -195,6 +199,7 @@ def log_model(
         signature=signature,
         input_example=input_example,
         await_registration_for=await_registration_for,
+        artifacts=artifacts,
         **kwargs
     )
 
@@ -208,20 +213,18 @@ def save_model(
     pickle_module=None,
     signature: ModelSignature = None,
     input_example: ModelInputExample = None,
+    artifacts=None,
     **kwargs
 ):
     """
     Save a PyTorch model to a path on the local file system.
-
     :param pytorch_model: PyTorch model to be saved. Must accept a single ``torch.FloatTensor`` as
                           input and produce a single output tensor. Any code dependencies of the
                           model's class, including the class definition itself, should be
                           included in one of the following locations:
-
                           - The package(s) listed in the model's Conda environment, specified
                             by the ``conda_env`` parameter.
                           - One or more of the files specified by the ``code_paths`` parameter.
-
     :param path: Local path where the model is to be saved.
     :param conda_env: Either a dictionary representation of a Conda environment or the path to a
                       Conda environment yaml file. If provided, this decsribes the environment
@@ -229,7 +232,6 @@ def save_model(
                       contained in :func:`get_default_conda_env()`. If ``None``, the default
                       :func:`get_default_conda_env()` environment is added to the model. The
                       following is an *example* dictionary representation of a Conda environment::
-
                         {
                             'name': 'mlflow-env',
                             'channels': ['defaults'],
@@ -239,7 +241,6 @@ def save_model(
                                 'torchvision=0.2.1'
                             ]
                         }
-
     :param mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
     :param code_paths: A list of local filesystem paths to Python file dependencies (or directories
                        containing file dependencies). These files are *prepended* to the system
@@ -248,16 +249,13 @@ def save_model(
                           ``pytorch_model``. This is passed as the ``pickle_module`` parameter
                           to ``torch.save()``. By default, this module is also used to
                           deserialize ("unpickle") the PyTorch model at load time.
-
     :param signature: (Experimental) :py:class:`ModelSignature <mlflow.models.ModelSignature>`
                       describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
                       The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
                       from datasets with valid model input (e.g. the training dataset with target
                       column omitted) and valid model output (e.g. model predictions generated on
                       the training dataset), for example:
-
                       .. code-block:: python
-
                         from mlflow.models.signature import infer_signature
                         train = df.drop_column("target_label")
                         predictions = ... # compute model predictions
@@ -267,12 +265,23 @@ def save_model(
                           model. The given example will be converted to a Pandas DataFrame and then
                           serialized to json using the Pandas split-oriented format. Bytes are
                           base64-encoded.
-
+    :param artifacts: A dictionary containing ``<name, artifact_uri>`` entries. Remote artifact URIs
+                      are resolved to absolute filesystem paths, producing a dictionary of
+                      ``<name, absolute_path>`` entries. ``python_model`` can reference these
+                      resolved entries as the ``artifacts`` property of the ``context`` parameter
+                      in :func:`PythonModel.load_context() <mlflow.pyfunc.PythonModel.load_context>`
+                      and :func:`PythonModel.predict() <mlflow.pyfunc.PythonModel.predict>`.
+                      For example, consider the following ``artifacts`` dictionary::
+                        {
+                            "my_file": "s3://my-bucket/path/to/my/file"
+                        }
+                      In this case, the ``"my_file"`` artifact is downloaded from S3. The
+                      ``python_model`` can then refer to ``"my_file"`` as an absolute filesystem
+                      path via ``context.artifacts["my_file"]``.
+                      If ``None``, no artifacts are added to the model.
     :param kwargs: kwargs to pass to ``torch.save`` method.
-
     .. code-block:: python
         :caption: Example
-
         import torch
         import mlflow
         import mlflow.pytorch
@@ -325,6 +334,23 @@ def save_model(
         f.write(pickle_module.__name__)
     # Save pytorch model
     model_path = os.path.join(model_data_path, _SERIALIZED_TORCH_MODEL_FILE_NAME)
+    if artifacts:
+        if not isinstance(artifacts, dict):
+            raise TypeError("Argument artifacts should be a dict")
+
+        with TempDir() as tmp_artifacts_dir:
+            tmp_artifacts_config = {}
+            saved_artifacts_dir_subpath = "artifacts"
+            for artifact_name, artifact_uri in artifacts.items():
+                tmp_artifact_path = _download_artifact_from_uri(
+                    artifact_uri=artifact_uri, output_path=tmp_artifacts_dir.path()
+                )
+                tmp_artifacts_config[artifact_name] = tmp_artifact_path
+
+            shutil.move(
+                tmp_artifacts_dir.path(),
+                posixpath.join(path, saved_artifacts_dir_subpath),
+            )
     torch.save(pytorch_model, model_path, pickle_module=pickle_module, **kwargs)
 
     conda_env_subpath = "conda.yaml"
@@ -401,26 +427,20 @@ def _load_model(path, **kwargs):
 def load_model(model_uri, **kwargs):
     """
     Load a PyTorch model from a local file or a run.
-
     :param model_uri: The location, in URI format, of the MLflow model, for example:
-
                       - ``/Users/me/path/to/local/model``
                       - ``relative/path/to/local/model``
                       - ``s3://my_bucket/path/to/model``
                       - ``runs:/<mlflow_run_id>/run-relative/path/to/model``
                       - ``models:/<model_name>/<model_version>``
                       - ``models:/<model_name>/<stage>``
-
                       For more information about supported URI schemes, see
                       `Referencing Artifacts <https://www.mlflow.org/docs/latest/concepts.html#
                       artifact-locations>`_.
-
     :param kwargs: kwargs to pass to ``torch.load`` method.
     :return: A PyTorch model.
-
     .. code-block:: python
         :caption: Example
-
         import torch
         import mlflow
         import mlflow.pytorch
@@ -459,7 +479,6 @@ def load_model(model_uri, **kwargs):
 def _load_pyfunc(path, **kwargs):
     """
     Load PyFunc implementation. Called by ``pyfunc.load_pyfunc``.
-
     :param path: Local filesystem path to the MLflow Model with the ``pytorch`` flavor.
     """
     return _PyTorchWrapper(_load_model(path, **kwargs))
