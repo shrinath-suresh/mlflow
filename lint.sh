@@ -47,3 +47,4 @@ git ls-files | grep $include | grep -v $exclude | \
 xargs pylint --msg-template="$msg_template" --rcfile="$FWDIR/pylintrc"
 
 rstcheck README.rst
+
